@@ -121,6 +121,16 @@
   :group 'lsp-mode
   :type 'boolean)
 
+(defcustom lsp-use-native-json nil
+  "If non-nil, use native json parsing if available."
+  :group 'lsp-mode
+  :type 'boolean)
+
+(defcustom lsp-json-use-lists nil
+  "If non-nil, use lists instead of vectors when doing json deserialization."
+  :group 'lsp-mode
+  :type 'boolean)
+
 (defcustom lsp-log-max message-log-max
   "Maximum number of lines to keep in the log buffer.
 If nil, disable message logging.  If t, log messages but don’t truncate
@@ -601,7 +611,7 @@ FORMAT and ARGS i the same as for `message'."
   "Merge RESULTS by filtering the empty hash-tables and merging the lists.
 METHOD is the executed method so the results could be merged
 depending on it."
-  (pcase  (seq-remove #'null results)
+  (pcase (--map (if (vectorp it) (append it nil) it) (-filter 'identity results))
     (`() ())
     ;; only one result - simply return it
     (`(,fst) fst)
@@ -633,10 +643,11 @@ depending on it."
          ("isIncomplete" (seq-some
                           (-andfn #'ht? (-partial 'gethash "isIncomplete"))
                           results))
-         ("items" (apply 'append (seq-map
-                                  (lambda (it)
-                                    (if (ht? it) (gethash "items" it) it))
-                                  results)))))
+         ("items" (apply 'append (--map (append (if (ht? it)
+                                                    (gethash "items" it)
+                                                  it)
+                                                nil)
+                                        results)))))
        (_ (apply 'append (seq-map (lambda (it)
                                     (if (seqp it)
                                         it
@@ -757,10 +768,6 @@ INHERIT-INPUT-METHOD will be proxied to `completing-read' without changes."
   ;; current client is interested in executing the action instead of sending it
   ;; to the server.
   (action-handlers (make-hash-table :test 'equal) :read-only t)
-
-  ;; Use the native JSON API in Emacs 27 and above. If non-nil, JSON arrays will
-  ;; be parsed as vectors.
-  (use-native-json nil)
 
   ;; major modes supported by the client.
   (major-modes)
@@ -955,12 +962,13 @@ PARAMS - the data sent from _WORKSPACE."
 (defun lsp--window-log-message (workspace params)
   "Send the server's messages to log.
 PARAMS - the data sent from WORKSPACE."
-  (let* ((message (gethash "message" params))
-         (client (lsp--workspace-client workspace)))
-    (when (or (not client)
-              (cl-notany (-rpartial #'string-match-p message)
-                         (lsp--client-ignore-messages client)))
-      (lsp-log "%s" (lsp--propertize message (gethash "type" params))))))
+  (ignore
+   (let* ((message (gethash "message" params))
+          (client (lsp--workspace-client workspace)))
+     (when (or (not client)
+               (cl-notany (-rpartial #'string-match-p message)
+                          (lsp--client-ignore-messages client)))
+       (lsp-log "%s" (lsp--propertize message (gethash "type" params)))))))
 
 (defun lsp--window-log-message-request (params)
   "Display a message request to the user and send the user's selection back to the server."
@@ -1028,10 +1036,10 @@ WORKSPACE is the workspace that contains the diagnostics."
          (buffer (find-buffer-visiting file))
          (workspace-diagnostics (lsp--workspace-diagnostics workspace)))
 
-    (if diagnostics
-        (when (or lsp-report-if-no-buffer buffer)
-          (puthash file (seq-map #'lsp--make-diag diagnostics) workspace-diagnostics))
-      (remhash file workspace-diagnostics))
+    (if (seq-empty-p diagnostics)
+        (remhash file workspace-diagnostics)
+      (when (or lsp-report-if-no-buffer buffer)
+        (puthash file (seq-map #'lsp--make-diag diagnostics) workspace-diagnostics)))
 
     (when buffer
       (with-current-buffer buffer
@@ -1222,7 +1230,7 @@ VERSION is the version of the file. The lenses has to be
 refreshed only when all backends have reported for the same
 version."
   (setq-local lsp--lens-data (or lsp--lens-data (make-hash-table)))
-  (puthash backend (cons version lenses) lsp--lens-data)
+  (puthash backend (cons version (append lenses nil)) lsp--lens-data)
 
   (-let [backend-data (->> lsp--lens-data ht-values (-filter #'cl-rest))]
     (when (seq-every-p (-lambda ((version))
@@ -1302,7 +1310,7 @@ CALLBACK - callback for the lenses."
                                            (-mapcat
                                             (-lambda ((workspace . workspace-lenses))
                                               ;; preserve the original workspace so we can later use it to resolve the lens
-                                              (-each workspace-lenses (-partial 'puthash "workspace" workspace))
+                                              (seq-do (-partial 'puthash "workspace" workspace) workspace-lenses)
                                               workspace-lenses)
                                             lenses))
                                (if (--every? (gethash "command" it) lsp--lens-backend-cache)
@@ -1509,15 +1517,18 @@ If WORKSPACE is not provided current workspace will be used."
   (lsp--cur-workspace-check)
   (let* ((json-encoding-pretty-print lsp-print-io)
          (json-false :json-false)
-         (client (lsp--workspace-client lsp--cur-workspace))
-         (body (if (and (lsp--client-use-native-json client)
+         (body (if (and lsp-use-native-json
                         (fboundp 'json-serialize))
-                   (json-serialize params :null-object nil
-                                   :false-object json-false)
-                 (json-encode params)))
-         (body-with-newline (concat body "\n")))
-    (concat (format "Content-Length: %d\r\n\r\n" (string-bytes body-with-newline))
-            body-with-newline)))
+                   (with-no-warnings
+                     (json-serialize params
+                                     :null-object nil
+                                     :false-object :json-false))
+                 (json-encode params))))
+    (concat "Content-Length: "
+            (number-to-string (1+ (string-bytes body)))
+            "\r\n\r\n"
+            body
+            "\n")))
 
 (cl-defstruct lsp--log-entry
   (timestamp)
@@ -2486,7 +2497,8 @@ https://microsoft.github.io/language-server-protocol/specification#textDocument_
     result))
 
 (defun lsp--make-completion-item (item)
-  (propertize (lsp--gethash "insertText" item (gethash "label" item ""))
+  (propertize (or (gethash "insertText" item)
+                  (gethash "label" item ""))
               'lsp-completion-item
               item))
 
@@ -2525,14 +2537,13 @@ https://microsoft.github.io/language-server-protocol/specification#textDocument_
               (seq-into (seq-map #'lsp--make-completion-item items) 'list))))
        :annotation-function #'lsp--annotate))))
 
-(defun lsp--sort-string (c)
-  (lsp--gethash "sortText" c (gethash "label" c "")))
+(define-inline lsp--sort-string (c)
+  (inline-quote (or (gethash "sortText" ,c)
+                    (gethash "label" ,c ""))))
 
 (defun lsp--sort-completions (completions)
-  (seq-into (sort completions
-                  (lambda (c1 c2)
-                    (string-lessp (lsp--sort-string c1) (lsp--sort-string c2))))
-            'list))
+  "Sort COMPLETIONS."
+  (--sort (string-lessp (lsp--sort-string it) (lsp--sort-string other)) completions))
 
 (defun lsp--resolve-completion (item)
   "Resolve completion ITEM."
@@ -2574,7 +2585,7 @@ https://microsoft.github.io/language-server-protocol/specification#textDocument_
   (unless (seq-empty-p locations)
     (cl-labels ((get-xrefs-in-file
                  (file-locs location-link)
-                 (let* ((filename (car file-locs))
+                 (let* ((filename (seq-first file-locs))
                         (visiting (find-buffer-visiting filename))
                         (fn (lambda (loc)
                               (lsp--xref-make-item filename
@@ -2583,11 +2594,11 @@ https://microsoft.github.io/language-server-protocol/specification#textDocument_
                                                      (gethash "range" loc))))))
                    (if visiting
                        (with-current-buffer visiting
-                         (mapcar fn (cdr file-locs)))
+                         (seq-map fn (cdr file-locs)))
                      (when (file-readable-p filename)
                        (with-temp-buffer
                          (insert-file-contents-literally filename)
-                         (mapcar fn (cdr file-locs))))))))
+                         (seq-map fn (cdr file-locs))))))))
       (apply #'append
              (if (gethash "uri" (seq-first locations))
                  (seq-map
@@ -2725,17 +2736,19 @@ RENDER-ALL - nil if only the signature should be rendered."
   (-when-let* (((&hash "activeSignature" active-signature-index
                        "activeParameter" active-parameter
                        "signatures") signature-help)
+               (signatures (append signatures nil))
                (signature (seq-elt signatures (or active-signature-index 0)))
                (result (lsp--fontlock-with-mode (gethash "label" signature) major-mode)))
     (-when-let* (((&hash "parameters" parameters) signature)
                  (param (seq-elt parameters active-parameter))
-                 (selected-param-label (-some->> param (gethash "label")))
+                 (selected-param-label (let ((label (-some->> param (gethash "label"))))
+                                         (if (stringp label) label (append label nil))))
                  (start (if (stringp selected-param-label)
                             (s-index-of selected-param-label result)
-                          (seq-first selected-param-label)))
+                          (cl-first selected-param-label)))
                  (end (if (stringp selected-param-label)
                           (+ start (length selected-param-label))
-                        (seq-elt selected-param-label (1- (seq-length selected-param-label))))))
+                        (cl-second selected-param-label))))
       (add-face-text-property start end 'eldoc-highlight-function-argument nil result))
     result))
 
@@ -3235,12 +3248,12 @@ textDocument/didOpen for the new file."
       (signal 'lsp-unknown-message-type (list json-data)))))
 
 (defconst lsp--default-notification-handlers
-  (ht ("window/showMessage" 'lsp--window-show-message)
-      ("window/logMessage" 'lsp--window-log-message)
-      ("textDocument/publishDiagnostics" 'lsp--on-diagnostics)
-      ("textDocument/diagnosticsEnd" 'ignore)
-      ("textDocument/diagnosticsBegin" 'ignore)
-      ("telemetry/event" 'ignore)))
+  (ht ("window/showMessage" #'lsp--window-show-message)
+      ("window/logMessage" #'lsp--window-log-message)
+      ("textDocument/publishDiagnostics" #'lsp--on-diagnostics)
+      ("textDocument/diagnosticsEnd" #'ignore)
+      ("textDocument/diagnosticsBegin" #'ignore)
+      ("telemetry/event" #'ignore)))
 
 (defun lsp--on-notification (workspace notification)
   "Call the appropriate handler for NOTIFICATION."
@@ -3318,6 +3331,7 @@ WORKSPACE is the active workspace."
     (cons key val)))
 
 (defun lsp--parser-reset (p)
+  "Reset parser P."
   (setf
    (lsp--parser-leftovers p) ""
    (lsp--parser-body-length p) nil
@@ -3326,15 +3340,19 @@ WORKSPACE is the active workspace."
    (lsp--parser-body p) nil
    (lsp--parser-reading-body p) nil))
 
-(defun lsp--read-json (str use-native-json)
-  (let* ((use-native-json (and use-native-json (fboundp 'json-parse-string)))
-         (json-array-type (if use-native-json 'vector 'list))
+(defun lsp--read-json (str)
+  "Read json string STR."
+  (let* ((use-native-json (and lsp-use-native-json (fboundp 'json-parse-string)))
+         (json-array-type (if lsp-json-use-lists 'list 'vector))
          (json-object-type 'hash-table)
          (json-false nil))
     (if use-native-json
         (with-no-warnings
-          (json-parse-string str :object-type 'hash-table
-                             :null-object nil :false-object nil))
+          (with-temp-buffer
+            (json-parse-string str
+                               :object-type 'hash-table
+                               :null-object nil
+                               :false-object nil)))
       (json-read-from-string str))))
 
 (defun lsp--log-request-time (server-id method id start-time before-send received-time after-parsed-time after-processed-time)
@@ -3374,7 +3392,7 @@ WORKSPACE is the active workspace."
     (let* ((client (lsp--workspace-client lsp--cur-workspace))
            (received-time (current-time))
            (server-id (lsp--client-server-id client))
-           (json-data (lsp--read-json msg (lsp--client-use-native-json client)))
+           (json-data (lsp--read-json msg))
            (after-parsed-time (current-time))
            (id (--when-let (gethash "id" json-data)
                  (if (stringp it) (string-to-number it) it)))
@@ -3562,7 +3580,7 @@ SYM can be either DocumentSymbol or SymbolInformation."
       (seq-map (lambda (nested-alist)
                  (cons (car nested-alist)
                        (seq-map #'lsp--symbol-to-imenu-elem (cdr nested-alist))))
-              (seq-group-by #'lsp--get-symbol-type (lsp--imenu-filter-symbols symbols))))))
+               (seq-group-by #'lsp--get-symbol-type (lsp--imenu-filter-symbols symbols))))))
 
 (defun lsp--imenu-filter-symbols (symbols)
   "Filter out unsupported symbols from SYMBOLS."
@@ -3996,6 +4014,7 @@ session workspce folder configuration for the server."
                       (lsp-session-server-id->folders)
                       (gethash (lsp--client-server-id client))
                       (-map 'lsp--path-to-uri)
+                      (apply 'vector)
                       (plist-put initialization-options :workspaceFolders))
             initialization-options)
       initialization-options)))
